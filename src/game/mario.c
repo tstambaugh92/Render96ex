@@ -786,7 +786,7 @@ static u32 set_mario_action_airborne(struct MarioState *m, u32 action, u32 actio
     f32 fowardVel;
 
     if (m->squishTimer != 0 || m->quicksandDepth >= 1.0f) {
-        if (action == ACT_DOUBLE_JUMP || action == ACT_TWIRLING) {
+        if (action == ACT_DOUBLE_JUMP || action == ACT_TWIRLING || action == ACT_SPIN_JUMP) {
             action = ACT_JUMP;
         }
     }
@@ -845,6 +845,17 @@ static u32 set_mario_action_airborne(struct MarioState *m, u32 action, u32 actio
             m->forwardVel *= 0.8f;
             break;
 
+        case ACT_SPIN_JUMP:
+            if (actionArg == 0) {
+                m->vel[1] = 65.0f;
+                m->faceAngle[1] = m->intendedYaw;
+            }
+            break;
+
+        case ACT_GROUND_POUND_JUMP:
+            m->vel[1] = 65.0f;
+            break;
+
         case ACT_WALL_KICK_AIR:
         case ACT_TOP_OF_POLE_JUMP:
             set_mario_y_vel_based_on_fspeed(m, 62.0f * getCharacterMultiplier(), 0.0f);
@@ -901,6 +912,10 @@ static u32 set_mario_action_airborne(struct MarioState *m, u32 action, u32 actio
 
         case ACT_JUMP_KICK:
             m->vel[1] = 20.0f;
+            break;
+
+        case ACT_WALL_SLIDE:
+            m->vel[1] = 0.0f;
             break;
     }
 
@@ -1060,7 +1075,11 @@ s32 set_jump_from_landing(struct MarioState *m) {
     if (mario_floor_is_steep(m)) {
         set_steep_jump_action(m);
     } else {
-        if ((m->doubleJumpTimer == 0) || (m->squishTimer != 0)) {
+        if (m->squishTimer != 0) {
+            set_mario_action(m, ACT_JUMP, 0);
+        } else if (m->input & INPUT_ANALOG_SPIN) {
+            set_mario_action(m, ACT_SPIN_JUMP, 0);
+        } else if (m->doubleJumpTimer == 0) {
             set_mario_action(m, ACT_JUMP, 0);
         } else {
             switch (m->prevAction) {
@@ -1149,7 +1168,12 @@ s32 hurt_and_set_mario_action(struct MarioState *m, u32 action, u32 actionArg, s
  */
 s32 check_common_action_exits(struct MarioState *m) {
     if (m->input & INPUT_A_PRESSED) {
-        return set_mario_action(m, ACT_JUMP, 0);
+        if ((m->input & INPUT_ANALOG_SPIN) && !(m->input & INPUT_ABOVE_SLIDE)) {
+            return set_mario_action(m, ACT_SPIN_JUMP, 0);
+        }
+        else {
+            return set_mario_action(m, ACT_JUMP, 0);
+        }
     }
     if (m->input & INPUT_OFF_FLOOR) {
         return set_mario_action(m, ACT_FREEFALL, 0);
@@ -1222,7 +1246,12 @@ s32 set_water_plunge_action(struct MarioState *m) {
         set_camera_mode(m->area->camera, CAMERA_MODE_WATER_SURFACE, 1);
     }
 
-    return set_mario_action(m, ACT_WATER_PLUNGE, 0);
+    if (m->action == ACT_GROUND_POUND) {
+        return set_mario_action(m, ACT_WATER_GROUND_POUND, 1);
+    }
+    else {
+        return set_mario_action(m, ACT_WATER_PLUNGE, 0);
+    }
 }
 
 /**
@@ -1326,8 +1355,12 @@ void update_mario_button_inputs(struct MarioState *m) {
  * Updates the joystick intended magnitude.
  */
 void update_mario_joystick_inputs(struct MarioState *m) {
+    #define SPIN_TIMER_SUCCESSFUL_INPUT 4
+
     struct Controller *controller = m->controller;
     f32 mag = ((controller->stickMag / 64.0f) * (controller->stickMag / 64.0f)) * 64.0f;
+    f32 lastIntendedMag = m->intendedMag;
+    s16 rawAngle;
 
     if (m->squishTimer == 0) {
         m->intendedMag = mag / 2.0f;
@@ -1344,15 +1377,87 @@ void update_mario_joystick_inputs(struct MarioState *m) {
         }
     }
 
+    rawAngle = atan2s(-controller->stickY, controller->stickX);
+
     if (m->intendedMag > 0.0f) {
         if (gLakituState.mode != CAMERA_MODE_NEWCAM)
-            m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + m->area->camera->yaw;
+            m->intendedYaw = rawAngle + m->area->camera->yaw;
         else
-            m->intendedYaw = atan2s(-controller->stickY, controller->stickX)-newcam_yaw+0x4000;
+            m->intendedYaw = rawAngle-newcam_yaw+0x4000;
         m->input |= INPUT_NONZERO_ANALOG;
     } else {
         m->intendedYaw = m->faceAngle[1];
     }
+
+    ////
+    // Update spin input
+    ////
+
+    // prevent issues due to the frame going out of the dead zone registering the last angle as 0
+    if (lastIntendedMag > 0.5f && m->intendedMag > 0.5f) {
+        s32 angleOverFrames = 0, thisFrameDelta = 0;
+        size_t i;
+
+        char newDirection   = m->spinDirection,
+             signedOverflow = FALSE;
+
+        if (rawAngle < m->controller->stickLastAngle) {
+            signedOverflow = m->controller->stickLastAngle - rawAngle > 0x8000;
+            newDirection = signedOverflow ? 1 : -1;
+        }
+        else if (rawAngle > m->controller->stickLastAngle) {
+            signedOverflow = rawAngle - m->controller->stickLastAngle > 0x8000;
+            newDirection = signedOverflow ? -1 : 1;
+        }
+
+        if (m->spinDirection != newDirection) {
+            for (i = 0; i < ANGLE_QUEUE_SIZE; i++) m->controller->angleDeltaQueue[i] = 0;
+            m->spinDirection = newDirection;
+        }
+        else {
+            for (i = ANGLE_QUEUE_SIZE-1; i > 0; i--) {
+                m->controller->angleDeltaQueue[i] = m->controller->angleDeltaQueue[i-1];
+                angleOverFrames += m->controller->angleDeltaQueue[i];
+            }
+        }
+
+        if (m->spinDirection < 0) {
+            if (signedOverflow) {
+                thisFrameDelta = (s32) ((1.0f*m->controller->stickLastAngle + 0x10000) - rawAngle);
+            }
+            else {
+                thisFrameDelta = m->controller->stickLastAngle - rawAngle;
+            }
+        }
+        else if (m->spinDirection > 0) {
+            if (signedOverflow) {
+                thisFrameDelta = (s32) (1.0f*rawAngle + 0x10000 - m->controller->stickLastAngle);
+            }
+            else {
+                thisFrameDelta = rawAngle - m->controller->stickLastAngle;
+            }
+        }
+
+        m->controller->angleDeltaQueue[0] = thisFrameDelta;
+
+        angleOverFrames += thisFrameDelta;
+
+        if (angleOverFrames >= 0xA000) {
+            m->spinBufferTimer = SPIN_TIMER_SUCCESSFUL_INPUT;
+        }
+
+        // allow a buffer after a successful input so that you can switch directions
+        if (m->spinBufferTimer > 0) {
+            m->input |= INPUT_ANALOG_SPIN;
+            m->spinBufferTimer--;
+        }
+    }
+    else {
+        m->spinDirection = 0;
+        m->spinBufferTimer = 0;
+    }
+
+    m->controller->stickLastAngle = rawAngle;
 }
 
 /**
@@ -1920,6 +2025,8 @@ void init_mario(void) {
 }
 
 void init_mario_from_save_file(void) {
+    size_t i;
+
     gMarioState->unk00 = 0;
     gMarioState->flags = 0;
     gMarioState->action = 0;
@@ -1927,6 +2034,9 @@ void init_mario_from_save_file(void) {
     gMarioState->statusForCamera = &gPlayerCameraState[0];
     gMarioState->marioBodyState = &gBodyStates[0];
     gMarioState->controller = &gControllers[0];
+
+    for (i = 0; i < ANGLE_QUEUE_SIZE; i++) gMarioState->controller->angleDeltaQueue[i] = 0;
+
     gMarioState->numCoins = 0;
     gMarioState->numStars =
         save_file_get_total_star_count(gCurrSaveFileNum - 1, COURSE_MIN - 1, COURSE_MAX - 1);
